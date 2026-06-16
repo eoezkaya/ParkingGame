@@ -4,12 +4,16 @@ import time
 import numpy as np
 import imageio.v2 as imageio
 
+# --- ALGORITHM TOGGLE (Simulated #ifdef) ---
+USE_PPO = True  # Set to True for PPO, False for DQN
+# -------------------------------------------
+
 # Fix for macOS OpenMP duplicate initialization
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QImage
-from stable_baselines3 import DQN
+from stable_baselines3 import DQN, PPO  # Imported both algorithms
 from parking_env import ParkingEnv
 
 
@@ -35,14 +39,17 @@ def play():
     # a segfault caused by Qt destroying the C++ object before Python GC runs.
     app.lastWindowClosed.connect(lambda: os._exit(0))
 
-    # 3. Load the trained model
-    model_path = "dqn_parking_model.zip"
+    # 3. Determine the model path and class type based on toggle
+    algo_str = "ppo" if USE_PPO else "dqn"
+    model_class = PPO if USE_PPO else DQN
+    model_path = f"{algo_str}_parking_model.zip"
+    
     if not os.path.exists(model_path):
         print(f"Error: {model_path} not found. Please run train.py first.")
         return
 
-    print(f"Loading model: {model_path}")
-    model = DQN.load(model_path)
+    print(f"Loading {algo_str.upper()} model: {model_path}")
+    model = model_class.load(model_path)
 
     # 4. Play multiple episodes and record video
     num_episodes = 5
@@ -77,7 +84,6 @@ def play():
                 writer.append_data(_capture_env_frame(env))
 
                 # Brief sleep to make the movement look natural for human eyes
-                # Increase this if the car moves too fast to see
                 time.sleep(0.01)
 
             final_score = env.calculate_final_score()

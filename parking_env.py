@@ -34,7 +34,7 @@ class ParkingEnv(gym.Env, QWidget):
         standing_reward_weight=0.2,
         delta_reward_weight=2.0,
         success_angle_threshold=0.02,
-        success_distance_threshold=5.0,
+        success_distance_threshold=10.0,
         success_reward=150.0,
         enable_training_spawns=False,
     ):
@@ -58,6 +58,7 @@ class ParkingEnv(gym.Env, QWidget):
         self.show_score_overlay = True
         self.show_front_wheels = True
         self.show_lidar = True
+        self.show_player_center_dot = False
         self.traffic_visible = True
         self.manual_keys = {"up": False, "down": False, "left": False, "right": False}
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -68,9 +69,9 @@ class ParkingEnv(gym.Env, QWidget):
         self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(21,), dtype=np.float32)
 
         # Load Assets (Assuming same directory)
-        self._car_pixmap = QPixmap("car.png")
+        self._car_pixmap = QPixmap("red_car.png")
         self._tree_pixmap = QPixmap("tree.png")
-        self._parked_car_pixmap = QPixmap("car.png")
+        self._parked_car_pixmap = QPixmap("yellow_car.png")
 
         self._build_car_points_grid()
 
@@ -661,10 +662,6 @@ class ParkingEnv(gym.Env, QWidget):
         if self._check_collisions():
             return 0.0
 
-        # 2. Strict Success: If it meets your exact bullseye criteria, give it a 100
-        if self._check_success():
-            return 100.0
-
         # 3. Gather current metrics (Identical to your _check_success tracking)
         player_corners = self._get_corners(self.car_x, self.car_y, self.car_theta)
         
@@ -695,63 +692,96 @@ class ParkingEnv(gym.Env, QWidget):
         # If the car is perfectly placed, components approach 1.0 -> Score approaches 100
         # If any single criteria is completely missed, the whole score drops to 0.0
         final_score = s_dist * s_align * s_lane * 100.0
+        print(f"s_dist={s_dist:.4f}, s_align={s_align:.4f}, s_lane={s_lane:.4f}")
         return float(final_score)
 
     
     
-    def test_score_system(self):
+    def test_score_system(self, num_trials=10, out_dir="score_test"):
         """
-        Places the car collision-free inside the lane and lets the
-        user drive it with the arrow keys in a free-play session.
+        Runs ``num_trials`` automated parking trials, scores each final pose,
+        and saves a PNG snapshot of the widget for every trial under ``out_dir``.
+
+        Each trial:
+          1. Spawns the car randomly inside the lane (collision-free).
+          2. Runs up to 500 steps using random actions.
+          3. Stops early on success or collision.
+          4. Captures the widget as a PNG and records the score.
         """
-        print("Use arrow keys to drive. The session runs until success or collision.")
-        print(f"{'X':>5} | {'Y':>5} | {'Angle':>7} | {'Lane %':>7} | {'Box %':>7} | {'Safe %':>7} | {'Score'}")
-        print("-" * 75)
+        import os
+        os.makedirs(out_dir, exist_ok=True)
 
-        placed = self._place_random_in_lane_collision_free()
-        if not placed:
-            print("Failed to find a collision-free spawn.")
-            return
+        num_trials = int(num_trials)
+        print(f"Running {num_trials} scoring trials → snapshots saved to '{out_dir}/'")
+        print(f"{'Trial':>5} | {'X':>6} | {'Y':>6} | {'Angle':>7} | {'Outcome':<10} | {'Score':>6}")
+        print("-" * 58)
 
-        self.steps = 0
-        self.prev_coverage = self.compute_coverage()
         self.show()
         self.activateWindow()
         self.raise_()
-        self.setFocus()
 
-        while True:
-            QApplication.processEvents()
-            self._apply_manual_control(0.016)
-            self.traffic_y -= 80.0 * 0.016
-            if self.traffic_y < -150:
-                self.traffic_y = 950.0
-            self.update()
+        prev_show_lidar = self.show_lidar
+        prev_show_front_wheels = self.show_front_wheels
+        prev_show_player_center_dot = self.show_player_center_dot
+        self.show_lidar = False
+        self.show_front_wheels = False
+        self.show_player_center_dot = False
 
-            c_lane = self.compute_coverage()
-            c_target = self.compute_target_coverage()
+        scores = []
+        for trial in range(1, num_trials + 1):
+            # --- Spawn ---
+            placed = self._place_random_in_lane_collision_free()
+            if not placed:
+                print(f"Trial {trial:2d}: spawn failed, skipping.")
+                continue
+
+            self.steps = 0
+            self.prev_coverage = self.compute_coverage()
+
+            outcome = "truncated"
+            for _ in range(500):
+                action = self.action_space.sample()
+                _, _, terminated, truncated, _ = self.step(action)
+                QApplication.processEvents()
+                if terminated:
+                    outcome = "success" if self._check_success() else "collision"
+                    break
+                if truncated:
+                    break
+
+            final_score = self.calculate_final_score()
+            scores.append(final_score)
+
             angle_diff = math.atan2(
                 math.sin(self.car_theta - self.target_theta),
                 math.cos(self.car_theta - self.target_theta),
             )
-            corners = self._get_corners(self.car_x, self.car_y, self.car_theta)
-            rightmost_x = max(corner[0] for corner in corners)
-            dist_to_wall = 710.0 - rightmost_x
-            s_safety = np.clip(dist_to_wall / 30.0, 0.0, 1.0)
-            final_score = self.calculate_final_score()
+
+            # --- Snapshot (cropped to parking area) ---
+            self.update()
+            QApplication.processEvents()
+            snapshot_path = os.path.join(out_dir, f"trial_{trial:02d}_score{final_score:.1f}.png")
+            pad = 60
+            crop_x = max(0, int(550 - pad))
+            crop_y = max(0, int(self.parked_car_ys[0] + self.parked_car_height / 2 - pad))
+            crop_w = min(800, int(710 + pad)) - crop_x
+            crop_h = min(800, int(self.parked_car_ys[1] - self.parked_car_height / 2 + pad)) - crop_y
+            from PyQt6.QtCore import QRect
+            pixmap = self.grab(QRect(crop_x, crop_y, crop_w, crop_h))
+            pixmap.save(snapshot_path)
 
             print(
-                f"{self.car_x:5.1f} | {self.car_y:5.1f} | {math.degrees(angle_diff):6.1f}° | "
-                f"{c_lane:6.2f} | {c_target:6.2f} | {s_safety:6.2f} | {final_score:5.1f}/100",
-                end="\r",
+                f"{trial:5d} | {self.car_x:6.1f} | {self.car_y:6.1f} | "
+                f"{math.degrees(angle_diff):6.1f}° | {outcome:<10} | {final_score:6.1f}"
             )
 
-            if self._check_collisions() or self._check_success():
-                print()
-                print(f"Final score: {final_score:.1f}/100")
-                break
-
-            time.sleep(0.016)
+        if scores:
+            print("-" * 58)
+            print(f"  avg={sum(scores)/len(scores):.1f}  min={min(scores):.1f}  max={max(scores):.1f}")
+        self.show_lidar = prev_show_lidar
+        self.show_front_wheels = prev_show_front_wheels
+        self.show_player_center_dot = prev_show_player_center_dot
+        print(f"Snapshots saved to '{os.path.abspath(out_dir)}/'.")
 
     def test_run(self):
         self.enable_training_spawns = True
@@ -944,11 +974,11 @@ class ParkingEnv(gym.Env, QWidget):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     env = ParkingEnv(render_mode="human")
-    env.test_score_system()
+#    env.test_score_system()
 #    env.test_car_points_grid(duration_sec=10.0)
 #    env.test_collision()
 #    env.test_run()
-#    env.test_lidar()
+    env.test_lidar()
 #    env.test_coverage()
 #    env.test_success()
     sys.exit(app.exec())
